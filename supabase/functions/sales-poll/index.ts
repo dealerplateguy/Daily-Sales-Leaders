@@ -10,11 +10,13 @@
 //   status = DEAL_STATUS IN ('BOOKED','CLOSED_OR_SOLD')      (booked-or-beyond)
 //   types  = DEAL_TYPE IN ('PERSONAL','BUSINESS','INTERNET','EMPLOYEE_PURCHASE')  (retail)
 //   gross  = raw FRONT_GROSS / BACK_GROSS / TOTAL_GROSS
-// Two windows in one query: MTD (1st-of-month .. today) and today only.
+// Writes ONE row per (store, day) into public.sales_daily for the whole window, so the
+// board can show Yesterday / Today / any picked day / MTD (summed client-side).
 //
 // Auth: caller must send `x-live-poll-token: <LIVE_POLL_TOKEN>` (pg_cron does).
 // Reuses the SAME token + verify_live_poll_token RPC as the advisor live-poll.
-// Query flags: ?force=1 bypass business-hours gate ; ?dry=1 compute but don't write.
+// Query flags: ?force=1 bypass business-hours gate ; ?dry=1 compute but don't write ;
+//   ?start=YYYY-MM-DD&end=YYYY-MM-DD  override the window (backfill past months).
 //
 // Deploy: supabase functions deploy sales-poll --no-verify-jwt
 // Secrets (shared with live-poll): SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, SNOWFLAKE_ROLE,
@@ -164,9 +166,8 @@ async function sfQuery(jwt: string, statement: string): Promise<string[][]> {
   throw new Error(`Snowflake query failed ${res.status}: ${await res.text()}`);
 }
 
-// ── Sales tally query (MTD + today in one pass) ──────────────────────────
-// One row per dealer_id × vehicle_type: MTD counts/gross + today counts/gross.
-function salesSql(mtdStart: string, today: string): string {
+// ── Sales query: one row per store × vehicle_type × DAY over [start,end] ──
+function salesSql(start: string, end: string): string {
   const CDATE =
     `TRY_TO_DATE(d.CONTRACT_DATE_SPLIT_YEAR||'-'||LPAD(d.CONTRACT_DATE_SPLIT_MONTH,2,'0')||'-'||LPAD(d.CONTRACT_DATE_SPLIT_DAY,2,'0'))`;
   return `
@@ -181,18 +182,16 @@ function salesSql(mtdStart: string, today: string): string {
         AND d.DEAL_STATUS IN ${inList(SOLD_STATUSES)}
         AND d.DEAL_TYPE   IN ${inList(RETAIL_TYPES)}
         AND d.VEHICLE_TYPE IN ('NEW','USED')
-        AND ${CDATE} BETWEEN '${mtdStart}' AND '${today}'
+        AND ${CDATE} BETWEEN '${start}' AND '${end}'
     )
-    SELECT DEALER_ID, VEHICLE_TYPE,
-      COUNT(*)                                                        AS MTD_UNITS,
-      COALESCE(SUM(FRONT_GROSS),0)                                    AS MTD_FRONT,
-      COALESCE(SUM(BACK_GROSS),0)                                     AS MTD_BACK,
-      COALESCE(SUM(TOTAL_GROSS),0)                                    AS MTD_TOTAL,
-      COUNT(CASE WHEN CDATE = '${today}' THEN 1 END)                  AS TODAY_UNITS,
-      COALESCE(SUM(CASE WHEN CDATE = '${today}' THEN FRONT_GROSS END),0) AS TODAY_FRONT,
-      COALESCE(SUM(CASE WHEN CDATE = '${today}' THEN BACK_GROSS  END),0) AS TODAY_BACK,
-      COALESCE(SUM(CASE WHEN CDATE = '${today}' THEN TOTAL_GROSS END),0) AS TODAY_TOTAL
-    FROM deals GROUP BY 1,2`;
+    SELECT DEALER_ID, TO_CHAR(CDATE,'YYYY-MM-DD') AS D, VEHICLE_TYPE,
+      COUNT(*)                      AS UNITS,
+      COALESCE(SUM(FRONT_GROSS),0)  AS FRONT,
+      COALESCE(SUM(BACK_GROSS),0)   AS BACK,
+      COALESCE(SUM(TOTAL_GROSS),0)  AS TOTAL
+    FROM deals
+    WHERE CDATE IS NOT NULL
+    GROUP BY 1,2,3`;
 }
 
 function json(body: unknown, status = 200) {
@@ -217,66 +216,59 @@ Deno.serve(async (req) => {
   if (!force && !isBusinessHours(et)) return json({ ok: true, skipped: 'outside business hours', et });
 
   const { mtdStart, periodKey } = periodBounds(et.dateStr);
-  const today = et.dateStr;
+  // Default window = this month to date; ?start&?end override it (backfill).
+  const start = url.searchParams.get('start') || mtdStart;
+  const end = url.searchParams.get('end') || et.dateStr;
 
   try {
     const jwt = await makeJwt();
-    const raw = await sfQuery(jwt, salesSql(mtdStart, today));
+    const raw = await sfQuery(jwt, salesSql(start, end));
 
-    // Fold dealer × vehicle_type rows into one row per store.
-    const byStore = new Map<string, Record<string, number>>();
+    // Fold (dealer × day × vehicle_type) rows into one row per (dealer, day).
     const blank = () => ({
-      mtd_new_units: 0, mtd_new_front: 0, mtd_new_back: 0, mtd_new_total: 0,
-      mtd_used_units: 0, mtd_used_front: 0, mtd_used_back: 0, mtd_used_total: 0,
-      today_new_units: 0, today_new_front: 0, today_new_back: 0, today_new_total: 0,
-      today_used_units: 0, today_used_front: 0, today_used_back: 0, today_used_total: 0,
+      new_units: 0, new_front: 0, new_back: 0, new_total: 0,
+      used_units: 0, used_front: 0, used_back: 0, used_total: 0,
     });
-    for (const [dealer, vt, mu, mf, mb, mt, tu, tf, tb, tt] of raw) {
+    const byKey = new Map<string, Record<string, unknown>>();
+    for (const [dealer, day, vt, units, front, back, total] of raw) {
       if (!STORES[dealer]) continue;
-      if (!byStore.has(dealer)) byStore.set(dealer, blank());
-      const s = byStore.get(dealer)!;
+      const key = `${dealer}|${day}`;
+      let s = byKey.get(key);
+      if (!s) {
+        s = { dealer_id: dealer, sale_date: day, store_name: STORES[dealer].name, region: STORES[dealer].region, ...blank() };
+        byKey.set(key, s);
+      }
       const k = vt === 'NEW' ? 'new' : 'used';
-      s[`mtd_${k}_units`] = Number(mu) || 0;
-      s[`mtd_${k}_front`] = n(mf); s[`mtd_${k}_back`] = n(mb); s[`mtd_${k}_total`] = n(mt);
-      s[`today_${k}_units`] = Number(tu) || 0;
-      s[`today_${k}_front`] = n(tf); s[`today_${k}_back`] = n(tb); s[`today_${k}_total`] = n(tt);
+      s[`${k}_units`] = Number(units) || 0;
+      s[`${k}_front`] = n(front); s[`${k}_back`] = n(back); s[`${k}_total`] = n(total);
     }
 
     const nowIso = new Date().toISOString();
-    // Every store gets a row (zeros if no deals), so the board shows the full field.
-    const rows = STORE_IDS.map((dealer) => ({
-      dealer_id: dealer,
-      store_name: STORES[dealer].name,
-      region: STORES[dealer].region,
-      period_key: periodKey,
-      board_date: today,
-      ...(byStore.get(dealer) || blank()),
-      updated_at: nowIso,
-    }));
+    const rows = [...byKey.values()].map((s) => ({ ...s, updated_at: nowIso }));
 
-    if (dry) return json({ ok: true, dry: true, et, periodKey, count: rows.length, sample: rows.slice(0, 5) });
+    if (dry) return json({ ok: true, dry: true, et, start, end, rows: rows.length, sample: rows.slice(0, 6) });
 
-    // Upsert only changed rows (keeps Realtime cheap).
-    const { data: prev } = await db.from('sales_live_tallies').select('*');
-    const prevByDealer = new Map<string, Record<string, unknown>>();
-    for (const p of prev || []) prevByDealer.set(p.dealer_id, p);
-    const NUMERIC_COLS = Object.keys(blank());
+    // Upsert only changed (dealer, day) rows in the window (keeps Realtime cheap).
+    const { data: prev } = await db.from('sales_daily').select('*').gte('sale_date', start).lte('sale_date', end);
+    const prevByKey = new Map<string, Record<string, unknown>>();
+    for (const p of prev || []) prevByKey.set(`${p.dealer_id}|${p.sale_date}`, p);
+    const NUM = ['new_units', 'new_front', 'new_back', 'new_total', 'used_units', 'used_front', 'used_back', 'used_total'];
     const changed = rows.filter((r) => {
-      const p = prevByDealer.get(r.dealer_id);
+      const p = prevByKey.get(`${r.dealer_id}|${r.sale_date}`);
       if (!p) return true;
-      return NUMERIC_COLS.some((c) => Number((p as Record<string, unknown>)[c]) !== Number((r as Record<string, unknown>)[c]));
+      return NUM.some((c) => Number(p[c]) !== Number((r as Record<string, unknown>)[c]));
     });
     if (changed.length > 0) {
-      const { error: upErr } = await db.from('sales_live_tallies').upsert(changed, { onConflict: 'dealer_id' });
+      const { error: upErr } = await db.from('sales_daily').upsert(changed, { onConflict: 'dealer_id,sale_date' });
       if (upErr) throw upErr;
     }
 
     await db.from('sales_live_meta').upsert({
       id: 1, last_poll_at: nowIso, last_poll_status: 'ok',
-      period_key: periodKey, board_date: today, rows_changed: changed.length, note: null, updated_at: nowIso,
+      period_key: periodKey, board_date: et.dateStr, rows_changed: changed.length, note: null, updated_at: nowIso,
     }, { onConflict: 'id' });
 
-    return json({ ok: true, et, periodKey, field: rows.length, changed: changed.length });
+    return json({ ok: true, et, start, end, storeDays: rows.length, changed: changed.length });
   } catch (err) {
     const msg = (err as Error).message || 'error';
     try {

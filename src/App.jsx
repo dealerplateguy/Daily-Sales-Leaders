@@ -2,13 +2,13 @@ import { useEffect, useState } from 'react';
 import { supabase } from './supabase.js';
 import Login from './Login.jsx';
 import BoardView from './BoardView.jsx';
-import { SAMPLE_ROWS, SAMPLE_META } from './_sampleData.js'; // DEV-only; tree-shaken in prod
+import { SAMPLE_DAILY } from './_sampleData.js'; // DEV-only; tree-shaken in prod
 
 export default function App() {
   // DEV-ONLY: /?preview=1 renders the board with sample data (no login). This whole
   // branch is behind import.meta.env.DEV so Vite drops it from the production build.
   if (import.meta.env.DEV && new URLSearchParams(window.location.search).get('preview')) {
-    return <BoardView email="preview@dev" sampleRows={SAMPLE_ROWS} sampleMeta={SAMPLE_META} />;
+    return <BoardView email="preview@dev" sampleDaily={SAMPLE_DAILY} />;
   }
 
   const [session, setSession] = useState(undefined); // undefined = loading
