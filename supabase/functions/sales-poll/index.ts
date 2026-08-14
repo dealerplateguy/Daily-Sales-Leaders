@@ -65,7 +65,13 @@ const STORES: Record<string, { name: string; region: string }> = {
 };
 const STORE_IDS = Object.keys(STORES);
 
-const RETAIL_TYPES = ['PERSONAL', 'BUSINESS', 'INTERNET', 'EMPLOYEE_PURCHASE'];
+// Counted sale types. HOUSE ("house deals") is included: Tekion counts house deals
+// in BOTH the Sales Recap and the daily Deals report. Verified 2026-08-14 — adding
+// HOUSE makes Indiana Aug 11-12 tie to the Recap on New AND Used to the exact dollar
+// (New 42/$137,141, Used 44/$117,283) and matches the daily per-store counts
+// (Schaumburg Kia 7, Schaumburg Honda 13, FW Kia 10). Still excludes WHOLESALE,
+// DEALER_TRADE, FLEET, ONLY_FINANCE_AND_INSURANCE, ONLY_TRADES (not retail units).
+const RETAIL_TYPES = ['PERSONAL', 'BUSINESS', 'INTERNET', 'EMPLOYEE_PURCHASE', 'HOUSE'];
 const SOLD_STATUSES = ['BOOKED', 'CLOSED_OR_SOLD'];
 
 // Business hours gate (ET, DST-aware). Match the advisor board cadence: Mon-Sat,
