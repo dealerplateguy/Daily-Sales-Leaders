@@ -271,6 +271,13 @@ Deno.serve(async (req) => {
     // MTD 1424/1293 here vs 1400/1280 in Snowflake, plus a phantom selling
     // day). Delete them so the derived table converges on the truth.
     const gone = [...prevByKey.keys()].filter((k) => !byKey.has(k));
+    // Blast-radius guard: a partitioned/truncated Snowflake result once made
+    // half the window look "unwound" (2026-08-26, one 3.5-month call). If
+    // more than 20% of existing rows would vanish, something is wrong with
+    // the RESULT, not the deals - keep the rows and say so.
+    if (gone.length > Math.max(5, (prevByKey.size * 0.2))) {
+      return json({ ok: false, error: 'refusing_mass_delete', wouldRemove: gone.length, windowRows: prevByKey.size, start, end }, 500);
+    }
     for (const k of gone) {
       const [dealer_id, sale_date] = k.split('|');
       const { error: delErr } = await db.from('sales_daily').delete()
