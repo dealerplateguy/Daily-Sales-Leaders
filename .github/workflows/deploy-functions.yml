@@ -1,0 +1,45 @@
+name: Deploy edge functions
+
+# Edge functions deployed by hand caused two incidents on 2026-08-26 alone:
+# sales_daily ran ~1% hot for weeks because a hand-deployed function could not heal unwound days.
+# This deploys every function in supabase/functions/ to the consolidated
+# project whenever their source changes. COST: ~1 min on ubuntu-latest, and
+# only when function code actually changes.
+#
+# --no-verify-jwt is deliberate: these functions verify Clerk tokens and
+# shared secrets in code; the gateway JWT check would reject Clerk tokens
+# before the code ran.
+
+on:
+  push:
+    branches: [main]
+    paths: ['supabase/functions/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fn-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: supabase/setup-cli@v1
+        with:
+          version: 2.90.0
+      - name: Deploy all functions to the consolidated project
+        run: |
+          set -e
+          for fn in $(ls supabase/functions | grep -v _shared); do
+            echo "— $fn"
+            supabase functions deploy "$fn" --project-ref oseqfvxemajuontjftui --no-verify-jwt
+          done

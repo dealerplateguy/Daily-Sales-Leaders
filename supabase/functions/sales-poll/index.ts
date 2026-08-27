@@ -264,6 +264,20 @@ Deno.serve(async (req) => {
       if (!p) return true;
       return NUM.some((c) => Number(p[c]) !== Number((r as Record<string, unknown>)[c]));
     });
+    // Rows in the DB window that Snowflake no longer returns are UNWOUND
+    // days: every deal that made the row got deleted or lost sold status.
+    // Upsert-only left them standing forever, which had sales_daily running
+    // ~1% above the source (found reconciling the CEO brief, 2026-08-26:
+    // MTD 1424/1293 here vs 1400/1280 in Snowflake, plus a phantom selling
+    // day). Delete them so the derived table converges on the truth.
+    const gone = [...prevByKey.keys()].filter((k) => !byKey.has(k));
+    for (const k of gone) {
+      const [dealer_id, sale_date] = k.split('|');
+      const { error: delErr } = await db.from('sales_daily').delete()
+        .eq('dealer_id', dealer_id).eq('sale_date', sale_date);
+      if (delErr) throw delErr;
+    }
+
     if (changed.length > 0) {
       const { error: upErr } = await db.from('sales_daily').upsert(changed, { onConflict: 'dealer_id,sale_date' });
       if (upErr) throw upErr;
@@ -274,7 +288,7 @@ Deno.serve(async (req) => {
       period_key: periodKey, board_date: et.dateStr, rows_changed: changed.length, note: null, updated_at: nowIso,
     }, { onConflict: 'id' });
 
-    return json({ ok: true, et, start, end, storeDays: rows.length, changed: changed.length });
+    return json({ ok: true, et, start, end, storeDays: rows.length, changed: changed.length, removed: gone.length });
   } catch (err) {
     const msg = (err as Error).message || 'error';
     try {
